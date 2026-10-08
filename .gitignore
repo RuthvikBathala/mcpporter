@@ -1,0 +1,22 @@
+# Binaries
+mcpporter
+echo-server
+*.exe
+
+# Build output
+/bin/
+/dist/
+
+# Test artifacts
+*.test
+*.out
+coverage.html
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Runtime audit logs
+*.jsonl

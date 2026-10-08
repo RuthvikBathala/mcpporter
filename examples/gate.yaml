@@ -1,0 +1,41 @@
+# Example mcpporter configuration.
+#
+# Run the quickstart:
+#   go build -o /tmp/echo-server ./examples/echo-server
+#   go build -o /tmp/mcpporter ./cmd/mcpporter
+#   /tmp/mcpporter validate --config examples/gate.yaml
+#   /tmp/mcpporter serve --config examples/gate.yaml
+
+gate:
+  name: demo
+  # Prefix upstream tool names to avoid collisions: demo__echo.
+  tool_prefix: true
+  prefix_separator: "__"
+
+upstreams:
+  - name: demo
+    transport: stdio
+    command: /tmp/echo-server
+    # Secrets reach upstreams via ${ENV} expansion — clients never see them.
+    env:
+      DEMO_API_KEY: "${DEMO_API_KEY:-unset}"
+
+routes:
+  # Cache echo results for 1 minute.
+  - pattern: "demo__echo"
+    upstream: demo
+    cache: true
+    cache_ttl: 1m
+  # Everything else passes through uncached, rate-limited.
+  - pattern: "*"
+    upstream: demo
+    rate_limit:
+      per_second: 20
+      burst: 40
+
+admin:
+  # Local admin endpoint: GET /healthz and GET /status.
+  listen: 127.0.0.1:18080
+
+audit:
+  path: /tmp/mcpporter-audit.jsonl
