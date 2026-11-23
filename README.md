@@ -83,9 +83,13 @@ upstreams:
     env:
       GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_TOKEN}"  # injected from gateway env
   - name: remote
-    # Streamable HTTP (MCP 2025-03-26+): single POST endpoint, replies
-    # are JSON or SSE streams. Use transport: sse with an /sse URL for
-    # legacy HTTP+SSE servers (deprecated upstream since 2025-03-26).
+    # Streamable HTTP: single POST endpoint, replies are JSON or SSE
+    # streams. The client is dual-era: it probes stateless
+    # (2026-07-28+) servers with server/discover and speaks the
+    # per-request _meta protocol with no session, and falls back to
+    # the 2025-03-26 initialize handshake + Mcp-Session-Id for legacy
+    # servers. Use transport: sse with an /sse URL for legacy
+    # HTTP+SSE servers (deprecated upstream since 2025-03-26).
     transport: streamable-http
     url: https://mcp.example.com/mcp
     headers:
@@ -135,7 +139,9 @@ cmd/mcpporter/      CLI (serve / validate / version)
 internal/
   mcp/              JSON-RPC 2.0 framing + MCP types (initialize, tools/list, tools/call)
   config/           gate.yaml loading, ${ENV} expansion, validation
-  upstream/         MCP clients: stdio (subprocess), Streamable HTTP, and legacy SSE transports
+  upstream/         MCP clients: stdio (subprocess), Streamable HTTP
+                    (dual-era: stateless 2026-07-28 via server/discover,
+                    legacy handshake + sessions), and legacy SSE transports
   proxy/            gateway core: aggregation, prefixing, routing, cache,
                     rate limiting, audit, debug redaction; stdio + HTTP serving
   cache/            TTL cache keyed by (tool, canonical args hash)
@@ -152,6 +158,12 @@ entire dependency tree is `yaml.v3` + `cobra`.
 
 ## Roadmap
 
+- Stateless era on the gateway side: answer `server/discover` and accept
+  per-request `_meta` from clients (upstream side already speaks
+  2026-07-28 — see above)
+- Stateless `server/discover` probe for stdio upstreams (with the spec's
+  fallback-to-`initialize` rules and a bounded probe timeout)
+- `subscriptions/listen` support for stateless change notifications
 - Hot-reload of `gate.yaml` on SIGHUP
 - Per-client API keys on the gateway side
 - Prometheus `/metrics`

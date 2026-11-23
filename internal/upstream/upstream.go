@@ -10,6 +10,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -455,28 +456,113 @@ func (c *sseClient) Healthy() bool { return c.healthy.Load() }
 
 // ---------------------------------------------------------------------------
 // Streamable HTTP
+
+// ---------------------------------------------------------------------------
+// Streamable HTTP
 // ---------------------------------------------------------------------------
 
-// streamableHTTPClient implements the MCP Streamable HTTP transport
-// (spec 2025-03-26, which replaced the legacy HTTP+SSE transport):
-// every JSON-RPC message is an HTTP POST to a single endpoint, and the
-// server replies with either a plain JSON response or an SSE stream
-// carrying the response. If the server assigns a session during
-// initialize (Mcp-Session-Id response header), the client echoes it on
-// every later request and terminates it with DELETE on Close.
+// upstreamEra is the protocol era a Streamable HTTP upstream speaks,
+// detected once by Initialize and cached for the life of the client
+// (the spec makes era a property of the server, not of a request).
+type upstreamEra int
+
+const (
+	eraUnknown upstreamEra = iota
+	// eraLegacy: handshake era (2025-11-25 and earlier) — initialize
+	// handshake, optional Mcp-Session-Id session.
+	eraLegacy
+	// eraStateless: modern era (2026-07-28+) — no handshake, no
+	// session; every request carries its version and capabilities in
+	// params._meta (SEP-2575, SEP-2567).
+	eraStateless
+)
+
+// rpcFailure is a failed Streamable HTTP call: either a non-2xx HTTP
+// status or a JSON-RPC error, with the parsed RPC error preserved so
+// callers can recognize spec-defined errors (notably
+// UnsupportedProtocolVersionError, -32022) during era detection.
+type rpcFailure struct {
+	status int           // HTTP status, 0 if the call never got a response
+	rpc    *mcp.RPCError // parsed JSON-RPC error, if the body carried one
+	body   string        // raw body excerpt for non-RPC failures
+}
+
+func (e *rpcFailure) Error() string {
+	if e.rpc != nil {
+		return fmt.Sprintf("streamable-http post: status %d: %s", e.status, e.rpc.Error())
+	}
+	if e.body != "" {
+		return fmt.Sprintf("streamable-http post: status %d: %s", e.status, e.body)
+	}
+	return fmt.Sprintf("streamable-http post: status %d", e.status)
+}
+
+// rpcErrorOf extracts the JSON-RPC error from an error returned by the
+// Streamable HTTP transport, if there is one.
+func rpcErrorOf(err error) *mcp.RPCError {
+	var rf *rpcFailure
+	if errors.As(err, &rf) {
+		return rf.rpc
+	}
+	var re *mcp.RPCError
+	if errors.As(err, &re) {
+		return re
+	}
+	return nil
+}
+
+// StatelessInfo is optionally implemented by upstream clients that can
+// speak the stateless (2026-07-28+) protocol era. It lets callers such
+// as the proxy inspect the era negotiated with the upstream.
+type StatelessInfo interface {
+	// Stateless reports whether the upstream was detected as a
+	// stateless-era server (server/discover, no handshake/session).
+	Stateless() bool
+	// DiscoverResult returns the upstream's server/discover result,
+	// or nil if the upstream is legacy or Initialize has not run.
+	DiscoverResult() *mcp.DiscoverResult
+}
+
+// streamableHTTPClient implements the MCP Streamable HTTP transport as
+// a dual-era client:
+//
+//   - Legacy era (2025-03-26 and other handshake revisions): every
+//     JSON-RPC message is an HTTP POST to a single endpoint, the reply
+//     is plain JSON or an SSE stream, and if the server assigns a
+//     session during initialize (Mcp-Session-Id response header) the
+//     client echoes it on every later request and terminates it with
+//     DELETE on Close.
+//   - Stateless era (2026-07-28+): no initialize handshake and no
+//     session. Initialize probes with server/discover; later requests
+//     carry the protocol version and client capabilities in
+//     params._meta, plus the SEP-2243 routing headers (MCP-Protocol-
+//     Version, Mcp-Method, Mcp-Name).
+//
+// Era detection follows the spec's backward-compatibility rules for
+// Streamable HTTP: attempt a modern request (server/discover) and
+// inspect failures — a recognized modern error
+// (UnsupportedProtocolVersionError) identifies a stateless server,
+// anything else identifies a legacy server and the client falls back
+// to the initialize handshake. The verdict is cached on the client.
 type streamableHTTPClient struct {
 	url     string
 	headers map[string]string
 	http    *http.Client
 	healthy atomic.Bool
 	seq     int64 // request id counter; use atomic.AddInt64
-	mu      sync.Mutex
-	session string // Mcp-Session-Id, if the server assigned one
+
+	mu       sync.Mutex
+	session  string // Mcp-Session-Id, legacy era only
+	era      upstreamEra
+	version  string              // protocol version in use (per era)
+	discover *mcp.DiscoverResult // stateless era only
 }
 
 // NewStreamableHTTP returns a client for a Streamable HTTP MCP endpoint,
 // e.g. https://mcp.example.com/mcp. No connection is made here — the
-// transport is request/response, so Initialize issues the first POST.
+// transport is request/response, so Initialize issues the first POST
+// (a server/discover probe, falling back to the initialize handshake
+// for legacy servers).
 func NewStreamableHTTP(url string, headers map[string]string) (Client, error) {
 	if url == "" {
 		return nil, fmt.Errorf("streamable-http: url is required")
@@ -485,6 +571,8 @@ func NewStreamableHTTP(url string, headers map[string]string) (Client, error) {
 		url:     url,
 		headers: headers,
 		http:    &http.Client{Timeout: 0}, // per-request ctxs carry deadlines
+		era:     eraUnknown,
+		version: mcp.ProtocolVersion,
 	}
 	c.healthy.Store(true)
 	return c, nil
@@ -501,36 +589,81 @@ func (c *streamableHTTPClient) setSession(id string) {
 		return
 	}
 	c.mu.Lock()
-	c.session = id
+	// Stateless-era servers have no sessions; never adopt one.
+	if c.era != eraStateless {
+		c.session = id
+	}
 	c.mu.Unlock()
 }
 
+// mode returns the protocol version and era to speak on the next
+// request: stateless once a stateless upstream has been detected,
+// legacy otherwise (including before Initialize).
+func (c *streamableHTTPClient) mode() (version string, stateless bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.era == eraStateless {
+		return c.version, true
+	}
+	return mcp.ProtocolVersion, false
+}
+
+// Stateless implements StatelessInfo.
+func (c *streamableHTTPClient) Stateless() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.era == eraStateless
+}
+
+// DiscoverResult implements StatelessInfo.
+func (c *streamableHTTPClient) DiscoverResult() *mcp.DiscoverResult {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.discover
+}
+
 // newRequest builds a POST (or DELETE) request with the headers the
-// Streamable HTTP spec requires: the client must accept both JSON and
-// SSE replies, and must name the negotiated protocol version.
-func (c *streamableHTTPClient) newRequest(ctx context.Context, method, body string) (*http.Request, error) {
-	req, err := http.NewRequestWithContext(ctx, method, c.url, strings.NewReader(body))
+// transport requires. Legacy requests name the negotiated protocol
+// version and echo the session, if any. Stateless requests also carry
+// the SEP-2243 routing headers (Mcp-Method always, Mcp-Name when the
+// method has a name parameter) and never a session header.
+func (c *streamableHTTPClient) newRequest(ctx context.Context, httpMethod, body, version string, stateless bool, rpcMethod, name string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, httpMethod, c.url, strings.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	req.Header.Set("MCP-Protocol-Version", mcp.ProtocolVersion)
+	req.Header.Set("MCP-Protocol-Version", version)
 	for k, v := range c.headers {
 		req.Header.Set(k, v)
 	}
-	if sid := c.sessionID(); sid != "" {
+	if stateless {
+		req.Header.Set("Mcp-Method", rpcMethod)
+		if name != "" {
+			req.Header.Set("Mcp-Name", name)
+		}
+	} else if sid := c.sessionID(); sid != "" {
 		req.Header.Set("Mcp-Session-Id", sid)
 	}
 	return req, nil
 }
 
-// do performs one request/response round trip: POST req, then read the
-// matching response from either a JSON body or an SSE stream.
-func (c *streamableHTTPClient) do(ctx context.Context, method string, params any) (*mcp.Response, error) {
+// call performs one request/response round trip in the given era:
+// POST the request, then read the matching response from either a
+// JSON body or an SSE stream. In stateless mode the request params
+// gain the per-request _meta envelope (protocol version, client
+// capabilities, client info).
+func (c *streamableHTTPClient) call(ctx context.Context, method, name string, params any, version string, stateless bool) (*mcp.Response, error) {
 	id := atomic.AddInt64(&c.seq, 1)
 	var rawParams json.RawMessage
-	if params != nil {
+	if stateless {
+		var err error
+		rawParams, err = mcp.WithClientMeta(params, version)
+		if err != nil {
+			return nil, err
+		}
+	} else if params != nil {
 		var err error
 		rawParams, err = json.Marshal(params)
 		if err != nil {
@@ -541,7 +674,7 @@ func (c *streamableHTTPClient) do(ctx context.Context, method string, params any
 	if err != nil {
 		return nil, err
 	}
-	req, err := c.newRequest(ctx, http.MethodPost, string(raw))
+	req, err := c.newRequest(ctx, http.MethodPost, string(raw), version, stateless, method, name)
 	if err != nil {
 		return nil, err
 	}
@@ -553,7 +686,12 @@ func (c *streamableHTTPClient) do(ctx context.Context, method string, params any
 	c.setSession(resp.Header.Get("Mcp-Session-Id"))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("streamable-http post: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		fail := &rpcFailure{status: resp.StatusCode, body: strings.TrimSpace(string(body))}
+		var errResp mcp.Response
+		if json.Unmarshal(body, &errResp) == nil && errResp.Error != nil {
+			fail.rpc = errResp.Error
+		}
+		return nil, fail
 	}
 	var out *mcp.Response
 	if strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
@@ -567,9 +705,15 @@ func (c *streamableHTTPClient) do(ctx context.Context, method string, params any
 		return nil, fmt.Errorf("streamable-http response: %w", err)
 	}
 	if out.Error != nil {
-		return nil, out.Error
+		return nil, &rpcFailure{status: resp.StatusCode, rpc: out.Error}
 	}
 	return out, nil
+}
+
+// do performs a round trip in the client's currently detected era.
+func (c *streamableHTTPClient) do(ctx context.Context, method, name string, params any) (*mcp.Response, error) {
+	version, stateless := c.mode()
+	return c.call(ctx, method, name, params, version, stateless)
 }
 
 // readSSEResponse scans an SSE stream for the response matching id.
@@ -613,14 +757,15 @@ func readSSEResponse(r io.Reader, id int64) (*mcp.Response, error) {
 	return nil, fmt.Errorf("stream closed before response to request %d", id)
 }
 
-// notify sends a JSON-RPC notification. The server answers 202
-// Accepted with no body; any 2xx is success.
+// notify sends a JSON-RPC notification (legacy era only — the
+// stateless era has no notifications/initialized). The server answers
+// 202 Accepted with no body; any 2xx is success.
 func (c *streamableHTTPClient) notify(ctx context.Context, method string) error {
 	raw, err := json.Marshal(&mcp.Request{JSONRPC: "2.0", Method: method})
 	if err != nil {
 		return err
 	}
-	req, err := c.newRequest(ctx, http.MethodPost, string(raw))
+	req, err := c.newRequest(ctx, http.MethodPost, string(raw), mcp.ProtocolVersion, false, method, "")
 	if err != nil {
 		return err
 	}
@@ -637,11 +782,95 @@ func (c *streamableHTTPClient) notify(ctx context.Context, method string) error 
 	return nil
 }
 
+// Initialize detects the upstream's protocol era and performs whatever
+// opening exchange that era requires: a server/discover probe for
+// stateless (2026-07-28+) servers, or the classic initialize handshake
+// for legacy servers. The returned InitializeResult is synthesized
+// from the discover result in the stateless era, so existing callers
+// (proxy, validate) work unchanged against both eras.
 func (c *streamableHTTPClient) Initialize(ctx context.Context) (*mcp.InitializeResult, error) {
-	resp, err := c.do(ctx, "initialize", mcp.InitializeParams{
+	if res, handled, err := c.tryStateless(ctx); handled {
+		if err != nil {
+			c.healthy.Store(false)
+			return nil, err
+		}
+		c.healthy.Store(true)
+		return res, nil
+	}
+	return c.initializeLegacy(ctx)
+}
+
+// tryStateless probes the upstream with server/discover at the
+// stateless protocol version. handled=false means the upstream is a
+// legacy server and the caller should fall back to initialize.
+func (c *streamableHTTPClient) tryStateless(ctx context.Context) (res *mcp.InitializeResult, handled bool, err error) {
+	resp, err := c.call(ctx, "server/discover", "", nil, mcp.StatelessProtocolVersion, true)
+	if err != nil {
+		supported, recognized := mcp.ParseUnsupportedVersion(rpcErrorOf(err))
+		if !recognized {
+			// Per the spec's dual-era rules for Streamable HTTP, a
+			// failure without a recognized modern error body
+			// identifies a legacy server.
+			return nil, false, nil
+		}
+		// A recognized modern error: the server is stateless-era but
+		// does not speak our stateless version. Retry is only
+		// possible if it also advertises a legacy version we speak.
+		for _, v := range supported {
+			if v == mcp.StatelessProtocolVersion {
+				break
+			}
+			if !mcp.IsStatelessVersion(v) {
+				return nil, false, nil
+			}
+		}
+		return nil, true, fmt.Errorf("streamable-http: upstream supports protocol versions %v, none compatible with mcpporter (stateless %s, legacy %s)",
+			supported, mcp.StatelessProtocolVersion, mcp.ProtocolVersion)
+	}
+	var disc mcp.DiscoverResult
+	if err := json.Unmarshal(resp.Result, &disc); err != nil {
+		// A success response we cannot parse is not a legacy signal;
+		// surface it rather than masking it with a handshake attempt.
+		return nil, true, fmt.Errorf("streamable-http: parse server/discover result: %w", err)
+	}
+	if len(disc.SupportedVersions) == 0 {
+		// No version advertisement (e.g. a legacy server answering
+		// unknown methods with an empty result): not evidence of a
+		// stateless server, so fall back to the handshake.
+		return nil, false, nil
+	}
+	if !disc.Supports(mcp.StatelessProtocolVersion) {
+		if disc.Supports(mcp.ProtocolVersion) {
+			// Dual-era server advertising our legacy version: let the
+			// caller use the handshake.
+			return nil, false, nil
+		}
+		return nil, true, fmt.Errorf("streamable-http: upstream supports protocol versions %v, none compatible with mcpporter (stateless %s, legacy %s)",
+			disc.SupportedVersions, mcp.StatelessProtocolVersion, mcp.ProtocolVersion)
+	}
+	c.mu.Lock()
+	c.era = eraStateless
+	c.version = mcp.StatelessProtocolVersion
+	c.discover = &disc
+	c.session = ""
+	c.mu.Unlock()
+	out := &mcp.InitializeResult{
+		ProtocolVersion: mcp.StatelessProtocolVersion,
+		Capabilities:    disc.Capabilities,
+	}
+	if si := disc.ServerInfo(); si != nil {
+		out.ServerInfo = *si
+	}
+	return out, true, nil
+}
+
+// initializeLegacy performs the handshake-era opening exchange:
+// initialize, then the notifications/initialized notification.
+func (c *streamableHTTPClient) initializeLegacy(ctx context.Context) (*mcp.InitializeResult, error) {
+	resp, err := c.call(ctx, "initialize", "", mcp.InitializeParams{
 		ProtocolVersion: mcp.ProtocolVersion,
 		ClientInfo:      mcp.ClientInfo{Name: "mcpporter", Version: "0.1.0"},
-	})
+	}, mcp.ProtocolVersion, false)
 	if err != nil {
 		c.healthy.Store(false)
 		return nil, err
@@ -650,6 +879,12 @@ func (c *streamableHTTPClient) Initialize(ctx context.Context) (*mcp.InitializeR
 	if err := json.Unmarshal(resp.Result, &out); err != nil {
 		return nil, err
 	}
+	c.mu.Lock()
+	c.era = eraLegacy
+	if out.ProtocolVersion != "" {
+		c.version = out.ProtocolVersion
+	}
+	c.mu.Unlock()
 	// Fire-and-forget per the MCP spec.
 	_ = c.notify(ctx, "notifications/initialized")
 	c.healthy.Store(true)
@@ -657,7 +892,7 @@ func (c *streamableHTTPClient) Initialize(ctx context.Context) (*mcp.InitializeR
 }
 
 func (c *streamableHTTPClient) ListTools(ctx context.Context) ([]mcp.Tool, error) {
-	resp, err := c.do(ctx, "tools/list", nil)
+	resp, err := c.do(ctx, "tools/list", "", nil)
 	if err != nil {
 		c.healthy.Store(false)
 		return nil, err
@@ -671,7 +906,7 @@ func (c *streamableHTTPClient) ListTools(ctx context.Context) ([]mcp.Tool, error
 }
 
 func (c *streamableHTTPClient) CallTool(ctx context.Context, name string, args map[string]any) (*mcp.CallToolResult, error) {
-	resp, err := c.do(ctx, "tools/call", mcp.CallToolParams{Name: name, Arguments: args})
+	resp, err := c.do(ctx, "tools/call", name, mcp.CallToolParams{Name: name, Arguments: args})
 	if err != nil {
 		c.healthy.Store(false)
 		return nil, err
@@ -685,12 +920,13 @@ func (c *streamableHTTPClient) CallTool(ctx context.Context, name string, args m
 }
 
 func (c *streamableHTTPClient) Close() error {
-	// If the server assigned a session, terminate it explicitly, as
-	// the spec prescribes; failure is not fatal.
+	// Legacy era only: if the server assigned a session, terminate it
+	// explicitly, as the spec prescribes; failure is not fatal.
+	// Stateless-era servers have no session to terminate.
 	if c.sessionID() != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if req, err := c.newRequest(ctx, http.MethodDelete, ""); err == nil {
+		if req, err := c.newRequest(ctx, http.MethodDelete, "", mcp.ProtocolVersion, false, "", ""); err == nil {
 			if resp, err := c.http.Do(req); err == nil {
 				_, _ = io.Copy(io.Discard, resp.Body)
 				resp.Body.Close()
