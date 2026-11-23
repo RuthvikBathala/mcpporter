@@ -1,6 +1,9 @@
 // Package upstream implements MCP clients for the gateway's upstream
-// servers: stdio (spawned subprocess, JSON-RPC over pipes) and SSE
-// (server-sent events for responses, HTTP POST for requests).
+// servers: stdio (spawned subprocess, JSON-RPC over pipes), SSE (the
+// legacy HTTP+SSE transport: server-sent events for responses, HTTP
+// POST for requests), and Streamable HTTP (the transport that replaced
+// HTTP+SSE in MCP 2025-03-26: a single HTTP endpoint where every
+// message is a POST and the reply is plain JSON or an SSE stream).
 package upstream
 
 import (
@@ -449,3 +452,253 @@ func (c *sseClient) Close() error {
 }
 
 func (c *sseClient) Healthy() bool { return c.healthy.Load() }
+
+// ---------------------------------------------------------------------------
+// Streamable HTTP
+// ---------------------------------------------------------------------------
+
+// streamableHTTPClient implements the MCP Streamable HTTP transport
+// (spec 2025-03-26, which replaced the legacy HTTP+SSE transport):
+// every JSON-RPC message is an HTTP POST to a single endpoint, and the
+// server replies with either a plain JSON response or an SSE stream
+// carrying the response. If the server assigns a session during
+// initialize (Mcp-Session-Id response header), the client echoes it on
+// every later request and terminates it with DELETE on Close.
+type streamableHTTPClient struct {
+	url     string
+	headers map[string]string
+	http    *http.Client
+	healthy atomic.Bool
+	seq     int64 // request id counter; use atomic.AddInt64
+	mu      sync.Mutex
+	session string // Mcp-Session-Id, if the server assigned one
+}
+
+// NewStreamableHTTP returns a client for a Streamable HTTP MCP endpoint,
+// e.g. https://mcp.example.com/mcp. No connection is made here — the
+// transport is request/response, so Initialize issues the first POST.
+func NewStreamableHTTP(url string, headers map[string]string) (Client, error) {
+	if url == "" {
+		return nil, fmt.Errorf("streamable-http: url is required")
+	}
+	c := &streamableHTTPClient{
+		url:     url,
+		headers: headers,
+		http:    &http.Client{Timeout: 0}, // per-request ctxs carry deadlines
+	}
+	c.healthy.Store(true)
+	return c, nil
+}
+
+func (c *streamableHTTPClient) sessionID() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.session
+}
+
+func (c *streamableHTTPClient) setSession(id string) {
+	if id == "" {
+		return
+	}
+	c.mu.Lock()
+	c.session = id
+	c.mu.Unlock()
+}
+
+// newRequest builds a POST (or DELETE) request with the headers the
+// Streamable HTTP spec requires: the client must accept both JSON and
+// SSE replies, and must name the negotiated protocol version.
+func (c *streamableHTTPClient) newRequest(ctx context.Context, method, body string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, c.url, strings.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("MCP-Protocol-Version", mcp.ProtocolVersion)
+	for k, v := range c.headers {
+		req.Header.Set(k, v)
+	}
+	if sid := c.sessionID(); sid != "" {
+		req.Header.Set("Mcp-Session-Id", sid)
+	}
+	return req, nil
+}
+
+// do performs one request/response round trip: POST req, then read the
+// matching response from either a JSON body or an SSE stream.
+func (c *streamableHTTPClient) do(ctx context.Context, method string, params any) (*mcp.Response, error) {
+	id := atomic.AddInt64(&c.seq, 1)
+	var rawParams json.RawMessage
+	if params != nil {
+		var err error
+		rawParams, err = json.Marshal(params)
+		if err != nil {
+			return nil, err
+		}
+	}
+	raw, err := json.Marshal(&mcp.Request{JSONRPC: "2.0", ID: id, Method: method, Params: rawParams})
+	if err != nil {
+		return nil, err
+	}
+	req, err := c.newRequest(ctx, http.MethodPost, string(raw))
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("streamable-http post: %w", err)
+	}
+	defer resp.Body.Close()
+	c.setSession(resp.Header.Get("Mcp-Session-Id"))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("streamable-http post: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var out *mcp.Response
+	if strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+		out, err = readSSEResponse(resp.Body, id)
+	} else {
+		var decoded mcp.Response
+		err = json.NewDecoder(resp.Body).Decode(&decoded)
+		out = &decoded
+	}
+	if err != nil {
+		return nil, fmt.Errorf("streamable-http response: %w", err)
+	}
+	if out.Error != nil {
+		return nil, out.Error
+	}
+	return out, nil
+}
+
+// readSSEResponse scans an SSE stream for the response matching id.
+// Other messages on the stream (e.g. notifications) are ignored.
+func readSSEResponse(r io.Reader, id int64) (*mcp.Response, error) {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	var data []string
+	flush := func() (*mcp.Response, bool) {
+		if len(data) == 0 {
+			return nil, false
+		}
+		joined := strings.Join(data, "\n")
+		data = nil
+		var resp mcp.Response
+		if err := json.Unmarshal([]byte(joined), &resp); err != nil || resp.ID == nil {
+			return nil, false
+		}
+		if n, ok := resp.ID.(float64); !ok || int64(n) != id {
+			return nil, false
+		}
+		return &resp, true
+	}
+	for sc.Scan() {
+		line := sc.Text()
+		switch {
+		case strings.HasPrefix(line, "data:"):
+			data = append(data, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		case line == "":
+			if resp, ok := flush(); ok {
+				return resp, nil
+			}
+		}
+	}
+	if resp, ok := flush(); ok {
+		return resp, nil
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	return nil, fmt.Errorf("stream closed before response to request %d", id)
+}
+
+// notify sends a JSON-RPC notification. The server answers 202
+// Accepted with no body; any 2xx is success.
+func (c *streamableHTTPClient) notify(ctx context.Context, method string) error {
+	raw, err := json.Marshal(&mcp.Request{JSONRPC: "2.0", Method: method})
+	if err != nil {
+		return err
+	}
+	req, err := c.newRequest(ctx, http.MethodPost, string(raw))
+	if err != nil {
+		return err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	c.setSession(resp.Header.Get("Mcp-Session-Id"))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("streamable-http notification: status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func (c *streamableHTTPClient) Initialize(ctx context.Context) (*mcp.InitializeResult, error) {
+	resp, err := c.do(ctx, "initialize", mcp.InitializeParams{
+		ProtocolVersion: mcp.ProtocolVersion,
+		ClientInfo:      mcp.ClientInfo{Name: "mcpporter", Version: "0.1.0"},
+	})
+	if err != nil {
+		c.healthy.Store(false)
+		return nil, err
+	}
+	var out mcp.InitializeResult
+	if err := json.Unmarshal(resp.Result, &out); err != nil {
+		return nil, err
+	}
+	// Fire-and-forget per the MCP spec.
+	_ = c.notify(ctx, "notifications/initialized")
+	c.healthy.Store(true)
+	return &out, nil
+}
+
+func (c *streamableHTTPClient) ListTools(ctx context.Context) ([]mcp.Tool, error) {
+	resp, err := c.do(ctx, "tools/list", nil)
+	if err != nil {
+		c.healthy.Store(false)
+		return nil, err
+	}
+	var out mcp.ToolsListResult
+	if err := json.Unmarshal(resp.Result, &out); err != nil {
+		return nil, err
+	}
+	c.healthy.Store(true)
+	return out.Tools, nil
+}
+
+func (c *streamableHTTPClient) CallTool(ctx context.Context, name string, args map[string]any) (*mcp.CallToolResult, error) {
+	resp, err := c.do(ctx, "tools/call", mcp.CallToolParams{Name: name, Arguments: args})
+	if err != nil {
+		c.healthy.Store(false)
+		return nil, err
+	}
+	var out mcp.CallToolResult
+	if err := json.Unmarshal(resp.Result, &out); err != nil {
+		return nil, err
+	}
+	c.healthy.Store(true)
+	return &out, nil
+}
+
+func (c *streamableHTTPClient) Close() error {
+	// If the server assigned a session, terminate it explicitly, as
+	// the spec prescribes; failure is not fatal.
+	if c.sessionID() != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if req, err := c.newRequest(ctx, http.MethodDelete, ""); err == nil {
+			if resp, err := c.http.Do(req); err == nil {
+				_, _ = io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+			}
+		}
+	}
+	c.healthy.Store(false)
+	return nil
+}
+
+func (c *streamableHTTPClient) Healthy() bool { return c.healthy.Load() }

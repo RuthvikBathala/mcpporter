@@ -24,7 +24,9 @@ const (
 )
 
 // ProtocolVersion is the MCP protocol version mcpporter advertises.
-const ProtocolVersion = "2024-11-05"
+// 2025-03-26 is the revision that introduced the Streamable HTTP
+// transport (replacing the legacy HTTP+SSE transport).
+const ProtocolVersion = "2025-03-26"
 
 // Request is a JSON-RPC 2.0 request. When ID is nil the message is a
 // notification and no response is expected.

@@ -53,13 +53,13 @@ func (g GateConfig) Separator() string {
 // UpstreamConfig describes one upstream MCP server.
 type UpstreamConfig struct {
 	Name string `yaml:"name"`
-	// Transport is "stdio" or "sse".
+	// Transport is "stdio", "sse", or "streamable-http".
 	Transport string `yaml:"transport"`
 	// Stdio fields.
 	Command string            `yaml:"command"`
 	Args    []string          `yaml:"args"`
 	Env     map[string]string `yaml:"env"`
-	// SSE fields.
+	// HTTP fields (sse and streamable-http transports).
 	URL     string            `yaml:"url"`
 	Headers map[string]string `yaml:"headers"`
 	// Timeout for a single request, e.g. "30s". Defaults to 60s.
@@ -154,8 +154,12 @@ func (c *Config) Validate() error {
 			if u.URL == "" {
 				return fmt.Errorf("upstream %q: url is required for sse transport", u.Name)
 			}
+		case "streamable-http":
+			if u.URL == "" {
+				return fmt.Errorf("upstream %q: url is required for streamable-http transport", u.Name)
+			}
 		default:
-			return fmt.Errorf("upstream %q: transport must be stdio or sse, got %q", u.Name, u.Transport)
+			return fmt.Errorf("upstream %q: transport must be stdio, sse, or streamable-http, got %q", u.Name, u.Transport)
 		}
 		if u.Timeout != "" {
 			if _, err := time.ParseDuration(u.Timeout); err != nil {

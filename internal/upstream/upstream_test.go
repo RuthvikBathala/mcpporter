@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -127,6 +128,138 @@ func TestStdioCallToolError(t *testing.T) {
 		t.Error("expected error from boom tool")
 	}
 }
+
+// reqRecorder captures the headers of the last request a fake server
+// handled, safe for concurrent use by handler goroutines.
+type reqRecorder struct {
+	mu     sync.Mutex
+	header http.Header
+}
+
+func (r *reqRecorder) record(h http.Header) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.header = h.Clone()
+}
+
+func (r *reqRecorder) get(key string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.header.Get(key)
+}
+
+// fakeStreamableServer is a Streamable HTTP MCP endpoint: one POST
+// route that answers with plain JSON, or with an SSE stream when
+// stream is true. It assigns a session id on initialize and records
+// the headers/session of the last non-initialize request.
+func fakeStreamableServer(t *testing.T, stream bool) (*httptest.Server, *reqRecorder) {
+	t.Helper()
+	rec := &reqRecorder{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		var req mcp.Request
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad", 400)
+			return
+		}
+		if req.IsNotification() {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		rec.record(r.Header)
+		var result any
+		switch req.Method {
+		case "initialize":
+			w.Header().Set("Mcp-Session-Id", "test-session-1")
+			result = mcp.InitializeResult{ProtocolVersion: mcp.ProtocolVersion,
+				ServerInfo: mcp.ServerInfo{Name: "fake-streamable", Version: "0.0.1"}}
+		case "tools/list":
+			result = mcp.ToolsListResult{Tools: []mcp.Tool{{Name: "ping", InputSchema: map[string]any{}}}}
+		case "tools/call":
+			var p mcp.CallToolParams
+			_ = json.Unmarshal(req.Params, &p)
+			if p.Name == "boom" {
+				raw, _ := json.Marshal(mcp.Response{JSONRPC: "2.0", ID: req.ID,
+					Error: &mcp.RPCError{Code: mcp.ErrInternal, Message: "boom"}})
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write(raw)
+				return
+			}
+			result = mcp.TextResult("pong")
+		}
+		raw, _ := json.Marshal(result)
+		resp, _ := json.Marshal(mcp.Response{JSONRPC: "2.0", ID: req.ID, Result: raw})
+		if stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprintf(w, "event: message\ndata: %s\n\n", resp)
+			w.(http.Flusher).Flush()
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(resp)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, rec
+}
+
+func exerciseStreamable(t *testing.T, stream bool) {
+	t.Helper()
+	srv, lastReq := fakeStreamableServer(t, stream)
+	c, err := NewStreamableHTTP(srv.URL+"/mcp", map[string]string{"Authorization": "Bearer test-token"})
+	if err != nil {
+		t.Fatalf("NewStreamableHTTP: %v", err)
+	}
+	defer c.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := c.Initialize(ctx); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	tools, err := c.ListTools(ctx)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	if len(tools) != 1 || tools[0].Name != "ping" {
+		t.Fatalf("tools = %+v", tools)
+	}
+	// The spec-required headers and the session assigned at initialize
+	// must be present on this post-initialize request.
+	if got := lastReq.get("Accept"); !strings.Contains(got, "application/json") || !strings.Contains(got, "text/event-stream") {
+		t.Errorf("Accept = %q, want JSON and SSE", got)
+	}
+	if got := lastReq.get("MCP-Protocol-Version"); got != mcp.ProtocolVersion {
+		t.Errorf("MCP-Protocol-Version = %q, want %q", got, mcp.ProtocolVersion)
+	}
+	if got := lastReq.get("Mcp-Session-Id"); got != "test-session-1" {
+		t.Errorf("Mcp-Session-Id = %q, want test-session-1", got)
+	}
+	if got := lastReq.get("Authorization"); got != "Bearer test-token" {
+		t.Errorf("Authorization = %q, want injected header", got)
+	}
+	res, err := c.CallTool(ctx, "ping", nil)
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if !strings.Contains(res.Content[0].Text, "pong") {
+		t.Errorf("result = %+v", res)
+	}
+	if _, err := c.CallTool(ctx, "boom", nil); err == nil {
+		t.Error("expected error from boom tool")
+	}
+}
+
+// TestStreamableHTTPClientJSON exercises Streamable HTTP with plain
+// JSON responses.
+func TestStreamableHTTPClientJSON(t *testing.T) { exerciseStreamable(t, false) }
+
+// TestStreamableHTTPClientSSE exercises Streamable HTTP with SSE
+// streamed responses.
+func TestStreamableHTTPClientSSE(t *testing.T) { exerciseStreamable(t, true) }
 
 // TestSSEClient exercises the SSE transport against a self-contained fake
 // SSE server.

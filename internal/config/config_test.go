@@ -114,6 +114,12 @@ upstreams:
 routes:
   - {pattern: "*", upstream: a}
 `,
+		"streamable-http without url": `
+upstreams:
+  - {name: a, transport: streamable-http}
+routes:
+  - {pattern: "*", upstream: a}
+`,
 	}
 	for name, y := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -121,6 +127,30 @@ routes:
 				t.Errorf("expected validation error, got nil")
 			}
 		})
+	}
+}
+
+func TestLoadStreamableHTTPValid(t *testing.T) {
+	y := `
+upstreams:
+  - name: remote
+    transport: streamable-http
+    url: https://example.com/mcp
+    headers:
+      Authorization: "Bearer ${TEST_MCPPORTER_TOKEN}"
+routes:
+  - {pattern: "*", upstream: remote}
+`
+	t.Setenv("TEST_MCPPORTER_TOKEN", "secret-123")
+	cfg, err := Load(writeTemp(t, y))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Upstreams[0].Transport != "streamable-http" || cfg.Upstreams[0].URL != "https://example.com/mcp" {
+		t.Errorf("upstream misparsed: %+v", cfg.Upstreams[0])
+	}
+	if cfg.Upstreams[0].Headers["Authorization"] != "Bearer secret-123" {
+		t.Errorf("header not expanded: %q", cfg.Upstreams[0].Headers["Authorization"])
 	}
 }
 

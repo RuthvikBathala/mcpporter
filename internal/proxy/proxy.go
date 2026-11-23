@@ -80,6 +80,8 @@ func (g *Gateway) Connect(ctx context.Context) error {
 			c, err = upstream.NewStdio(u.Command, u.Args, u.Env)
 		case "sse":
 			c, err = upstream.NewSSE(u.URL, u.Headers)
+		case "streamable-http":
+			c, err = upstream.NewStreamableHTTP(u.URL, u.Headers)
 		}
 		if err != nil {
 			return fmt.Errorf("dial upstream %q: %w", u.Name, err)

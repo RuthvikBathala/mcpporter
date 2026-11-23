@@ -17,7 +17,7 @@ mcpporter sits between your MCP clients and your upstream servers and fixes that
 │ Claude Code │      │                  mcpporter                   │      │    github    │
 │ Claude      ├─────►│  routing · auth injection · cache · audit ·   ├─────►│   postgres   │
 │ Desktop     │ stdio│  rate limiting · admin API                   │ stdio│  filesystem  │
-│ Cursor      │      └──────────────────────────────────────────────┘  SSE └──────────────┘
+│ Cursor      │      └──────────────────────────────────────────────┘  HTTP └──────────────┘
 └─────────────┘                         │
                                         ▼
                                   /healthz /status
@@ -59,7 +59,7 @@ Try it manually:
 
 ```bash
 printf '%s\n' \
-  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"t","version":"0"}}}' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"t","version":"0"}}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
   '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"demo__echo","arguments":{"text":"hello"}}}' \
 | /tmp/mcpporter serve --config examples/gate.yaml 2>/dev/null
@@ -83,8 +83,11 @@ upstreams:
     env:
       GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_TOKEN}"  # injected from gateway env
   - name: remote
-    transport: sse
-    url: https://mcp.example.com/sse
+    # Streamable HTTP (MCP 2025-03-26+): single POST endpoint, replies
+    # are JSON or SSE streams. Use transport: sse with an /sse URL for
+    # legacy HTTP+SSE servers (deprecated upstream since 2025-03-26).
+    transport: streamable-http
+    url: https://mcp.example.com/mcp
     headers:
       Authorization: "Bearer ${MCP_TOKEN}"
 
@@ -132,7 +135,7 @@ cmd/mcpporter/      CLI (serve / validate / version)
 internal/
   mcp/              JSON-RPC 2.0 framing + MCP types (initialize, tools/list, tools/call)
   config/           gate.yaml loading, ${ENV} expansion, validation
-  upstream/         MCP clients: stdio (subprocess) and SSE transports
+  upstream/         MCP clients: stdio (subprocess), Streamable HTTP, and legacy SSE transports
   proxy/            gateway core: aggregation, prefixing, routing, cache,
                     rate limiting, audit, debug redaction; stdio + HTTP serving
   cache/            TTL cache keyed by (tool, canonical args hash)
@@ -149,7 +152,6 @@ entire dependency tree is `yaml.v3` + `cobra`.
 
 ## Roadmap
 
-- Streamable HTTP upstream transport
 - Hot-reload of `gate.yaml` on SIGHUP
 - Per-client API keys on the gateway side
 - Prometheus `/metrics`
