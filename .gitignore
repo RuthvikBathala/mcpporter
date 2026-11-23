@@ -1,6 +1,6 @@
 # Binaries
-mcpporter
-echo-server
+/mcpporter
+/echo-server
 *.exe
 
 # Build output
